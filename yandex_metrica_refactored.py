@@ -466,3 +466,569 @@ class ClickHouseManager:
         except Exception as e:
             logger.error(f"Ошибка при вставке данных: {e}")
             raise 
+
+class YandexMetrikaClient:
+    """Клиент для работы с API Яндекс.Метрики"""
+    
+    def __init__(self):
+        self.access_token = os.getenv("YM_TOKEN")
+        if not self.access_token:
+            raise ValueError("Отсутствует токен YM_TOKEN")
+        
+        self.field_configs = ConfigManager.get_field_config()
+        self.fields = [config.field for config in self.field_configs]
+    
+    def fetch_data_for_date(self, counter_id: str, date: str) -> List[List[Any]]:
+        """Загрузка данных за дату с улучшенной обработкой ошибок"""
+        if not DataValidator.validate_counter_id(counter_id):
+            raise ValueError(f"Некорректный ID счетчика: {counter_id}")
+        
+        if not DataValidator.validate_date_format(date):
+            raise ValueError(f"Некорректный формат даты: {date}")
+        
+        client = YandexMetrikaLogsapi(
+            access_token=self.access_token,
+            default_url_params={"counterId": counter_id},
+            wait_report=True
+        )
+        
+        params = {
+            "fields": ",".join(self.fields),
+            "source": "visits",
+            "date1": date,
+            "date2": date
+        }
+        
+        for attempt in range(Constants.MAX_RETRIES):
+            try:
+                logger.info(f"Попытка {attempt + 1}: Загрузка данных для счетчика {counter_id} за {date}")
+                
+                # Создаем запрос
+                result = client.create().post(params=params)
+                request_id = result["log_request"]["request_id"]
+                
+                # Ждем готовности и загружаем данные
+                report = client.download(requestId=request_id).get()
+                data = report().to_values()
+                
+                if not data:
+                    logger.info(f"Нет данных для счетчика {counter_id} за {date}")
+                    return []
+                
+                logger.info(f"Загружено {len(data)} строк для счетчика {counter_id} за {date}")
+                return data
+                
+            except Exception as e:
+                logger.error(f"Ошибка при загрузке данных (попытка {attempt + 1}): {e}")
+                if attempt < Constants.MAX_RETRIES - 1:
+                    sleep_time = Constants.RETRY_DELAY * (attempt + 1)
+                    logger.info(f"Ожидание {sleep_time} секунд перед повтором")
+                    time.sleep(sleep_time)
+                else:
+                    logger.error(f"Все попытки исчерпаны для счетчика {counter_id} за {date}")
+                    raise
+        
+        return []
+
+class YandexMetrikaETL:
+    """Основной ETL класс с улучшенной архитектурой"""
+    
+    def __init__(self):
+        self.ch_manager = ClickHouseManager()
+        self.ym_client = YandexMetrikaClient()
+        self.normalizer = DataNormalizer(ConfigManager.get_field_config())
+        
+        # Инициализация уведомлений (опционально)
+        try:
+            from utils.telegram_notify import TelegramNotifier
+            self.notifier = TelegramNotifier(debug_mode=True)
+        except ImportError:
+            logger.warning("TelegramNotifier не найден, уведомления отключены")
+            self.notifier = None
+    
+    @contextmanager
+    def memory_management(self):
+        """Контекстный менеджер для управления памятью"""
+        try:
+            yield
+        finally:
+            gc.collect()
+    
+    def _generate_date_range(self, start_date: str, end_date: str) -> List[str]:
+        """Генерация списка дат в диапазоне с валидацией"""
+        if not DataValidator.validate_date_range(start_date, end_date):
+            raise ValueError(f"Некорректный диапазон дат: {start_date} - {end_date}")
+        
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+        dates = []
+        
+        current_dt = start_dt
+        while current_dt <= end_dt:
+            dates.append(current_dt.strftime("%Y-%m-%d"))
+            current_dt += timedelta(days=1)
+        
+        return dates
+    
+    def get_dates_to_process(self, counter_id: str, start_date: str, end_date: str) -> List[str]:
+        """Определение дат для обработки"""
+        # Получаем существующие даты
+        existing_dates = self.ch_manager.get_existing_dates(counter_id, start_date, end_date)
+        
+        # Получаем даты с неполной загрузкой
+        incomplete_dates = self.ch_manager.get_incomplete_dates(counter_id, start_date, end_date)
+        
+        # Генерируем все даты в диапазоне
+        all_dates = set(self._generate_date_range(start_date, end_date))
+        
+        # Определяем даты для загрузки
+        missing_dates = all_dates - existing_dates
+        dates_to_process = list(missing_dates.union(set(incomplete_dates)))
+        dates_to_process.sort()
+        
+        logger.info(f"Всего дат в диапазоне: {len(all_dates)}")
+        logger.info(f"Существующих дат: {len(existing_dates)}")
+        logger.info(f"Дат с неполной загрузкой: {len(incomplete_dates)}")
+        logger.info(f"Дат к обработке: {len(dates_to_process)}")
+        
+        return dates_to_process
+    
+    def process_date(self, counter_id: str, date: str, site_name: str) -> Tuple[int, List[str]]:
+        """Обработка данных за одну дату"""
+        errors = []
+        
+        try:
+            with self.memory_management():
+                # Проверяем существующие данные
+                existing_dates = self.ch_manager.get_existing_dates(counter_id, date, date)
+                
+                if date in existing_dates:
+                    logger.info(f"Дата {date}: найдены существующие данные, выполняется перезагрузка")
+                    self.ch_manager.delete_date_data(counter_id, date)
+                
+                # Загружаем данные из API
+                raw_data = self.ym_client.fetch_data_for_date(counter_id, date)
+                
+                if not raw_data:
+                    logger.info(f"Нет данных для счетчика {counter_id} за {date}")
+                    return 0, errors
+                
+                # Нормализуем данные порциями для экономии памяти
+                total_inserted = 0
+                
+                for i in range(0, len(raw_data), Constants.MEMORY_BATCH_SIZE):
+                    batch = raw_data[i:i + Constants.MEMORY_BATCH_SIZE]
+                    
+                    # Нормализуем батч
+                    normalized_batch = [self.normalizer.normalize_row(row) for row in batch]
+                    
+                    # Вставляем в ClickHouse
+                    inserted = self.ch_manager.insert_data(normalized_batch, site_name)
+                    total_inserted += inserted
+                    
+                    # Освобождаем память
+                    del batch, normalized_batch
+                    
+                    if i % (Constants.MEMORY_BATCH_SIZE * 5) == 0:
+                        gc.collect()
+                
+                logger.info(f"Обработано {total_inserted} строк для счетчика {counter_id} за {date}")
+                return total_inserted, errors
+                
+        except Exception as e:
+            error_msg = f"Ошибка обработки даты {date}: {e}"
+            logger.error(error_msg)
+            errors.append(error_msg)
+            return 0, errors
+    
+    def process_counter(self, counter_id: str, site_name: str, 
+                       start_date: str, end_date: str) -> ProcessingResult:
+        """Обработка счетчика с детальной отчетностью"""
+        start_time = time.time()
+        
+        logger.info(f"Начало обработки счетчика {counter_id} ({site_name})")
+        
+        result = ProcessingResult(
+            counter_id=counter_id,
+            site_name=site_name,
+            status=ProcessingStatus.FAILED
+        )
+        
+        try:
+            # Создаем таблицу если не существует
+            self.ch_manager.create_table()
+            
+            # Определяем даты для обработки
+            dates_to_process = self.get_dates_to_process(counter_id, start_date, end_date)
+            
+            if not dates_to_process:
+                logger.info(f"Все данные для счетчика {counter_id} загружены полностью")
+                result.status = ProcessingStatus.SKIPPED
+                total_days = (datetime.strptime(end_date, "%Y-%m-%d") - 
+                            datetime.strptime(start_date, "%Y-%m-%d")).days + 1
+                result.dates_skipped = total_days
+                return result
+            
+            logger.info(f"Требуется обработать {len(dates_to_process)} дат")
+            
+            # Обрабатываем каждую дату
+            for date in dates_to_process:
+                try:
+                    inserted, date_errors = self.process_date(counter_id, date, site_name)
+                    
+                    result.total_loaded += inserted
+                    result.dates_processed += 1
+                    result.errors.extend(date_errors)
+                    
+                    # Задержка между запросами
+                    time.sleep(Constants.REQUEST_DELAY)
+                    
+                except Exception as e:
+                    error_msg = f"Критическая ошибка обработки даты {date}: {e}"
+                    logger.error(error_msg)
+                    result.errors.append(error_msg)
+                    continue
+            
+            # Определяем статус результата
+            if not result.errors:
+                result.status = ProcessingStatus.SUCCESS
+            elif result.total_loaded > 0:
+                result.status = ProcessingStatus.PARTIAL_SUCCESS
+            else:
+                result.status = ProcessingStatus.FAILED
+            
+            result.processing_time = time.time() - start_time
+            
+            logger.info(f"Завершена обработка счетчика {counter_id}. "
+                       f"Статус: {result.status.value}, "
+                       f"Загружено: {result.total_loaded} строк, "
+                       f"Обработано дат: {result.dates_processed}, "
+                       f"Ошибок: {len(result.errors)}, "
+                       f"Время: {result.processing_time:.2f}с")
+            
+        except Exception as e:
+            error_msg = f"Критическая ошибка при обработке счетчика {counter_id}: {e}"
+            logger.error(error_msg)
+            result.errors.append(error_msg)
+            result.status = ProcessingStatus.FAILED
+            result.processing_time = time.time() - start_time
+        
+        return result
+    
+    def send_notification(self, message: str, is_error: bool = False) -> None:
+        """Отправка уведомления"""
+        if self.notifier:
+            try:
+                self.notifier.send_message(message, is_error=is_error)
+            except Exception as e:
+                logger.warning(f"Ошибка отправки уведомления: {e}")
+
+# Инициализация ETL
+etl = YandexMetrikaETL()
+
+def process_single_counter(counter_id: str, site_name: str, **context) -> Dict[str, Any]:
+    """Задача для обработки одного счетчика"""
+    try:
+        # Получение параметров из Airflow Variables
+        days_back = int(Variable.get("ym_days_back", default_var=7))
+        start_date = (datetime.utcnow() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+        end_date = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
+        
+        logger.info(f"Период загрузки: {start_date} - {end_date}")
+        
+        # Валидация входных параметров
+        if not DataValidator.validate_counter_id(counter_id):
+            raise ValueError(f"Некорректный ID счетчика: {counter_id}")
+        
+        # Обрабатываем счетчик
+        result = etl.process_counter(counter_id, site_name, start_date, end_date)
+        
+        # Формируем сообщение для уведомления
+        status_emoji = {
+            ProcessingStatus.SUCCESS: "✅",
+            ProcessingStatus.PARTIAL_SUCCESS: "⚠️",
+            ProcessingStatus.FAILED: "❌",
+            ProcessingStatus.SKIPPED: "⏭️"
+        }
+        
+        emoji = status_emoji.get(result.status, "❓")
+        message = (f"{emoji} Счетчик {counter_id} ({site_name}):\n"
+                  f"Статус: {result.status.value}\n"
+                  f"Загружено: {result.total_loaded:,} строк\n"
+                  f"Обработано дат: {result.dates_processed}\n"
+                  f"Время: {result.processing_time:.2f}с")
+        
+        if result.errors:
+            message += f"\nОшибок: {len(result.errors)}"
+        
+        etl.send_notification(message, is_error=(result.status == ProcessingStatus.FAILED))
+        
+        # Возвращаем результат для XCom
+        return {
+            'counter_id': result.counter_id,
+            'site_name': result.site_name,
+            'status': result.status.value,
+            'total_loaded': result.total_loaded,
+            'dates_processed': result.dates_processed,
+            'dates_skipped': result.dates_skipped,
+            'errors': result.errors,
+            'processing_time': result.processing_time,
+            'success': result.status in [ProcessingStatus.SUCCESS, ProcessingStatus.SKIPPED]
+        }
+        
+    except Exception as e:
+        error_msg = f"⛔️ Критическая ошибка в задаче {counter_id}: {e}"
+        logger.error(error_msg)
+        etl.send_notification(error_msg, is_error=True)
+        raise
+
+def get_data_quality_report(**context) -> None:
+    """Отчет о качестве загруженных данных"""
+    try:
+        days_back = int(Variable.get("ym_days_back", default_var=7))
+        start_date = (datetime.utcnow() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+        end_date = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
+        
+        quality_query = f"""
+        WITH date_quality AS (
+            SELECT 
+                counter_id,
+                toDate(datetime) as date,
+                count() as row_count,
+                countDistinct(visit_id) as unique_visits,
+                min(visit_id) as min_visit,
+                max(visit_id) as max_visit,
+                CASE 
+                    WHEN max(visit_id) - min(visit_id) = 0 THEN 100
+                    ELSE countDistinct(visit_id) / (max(visit_id) - min(visit_id) + 1) * 100
+                END as coverage_percent
+            FROM dev.ym_visits
+            WHERE datetime >= %(start_date)s AND datetime <= %(end_date)s
+            GROUP BY counter_id, toDate(datetime)
+        )
+        SELECT 
+            counter_id,
+            date,
+            row_count,
+            coverage_percent
+        FROM date_quality
+        WHERE coverage_percent < %(threshold)s
+        ORDER BY counter_id, date
+        """
+        
+        quality_issues = etl.ch_manager.client.query(
+            quality_query,
+            parameters={
+                'start_date': start_date,
+                'end_date': f"{end_date} 23:59:59",
+                'threshold': Constants.COVERAGE_THRESHOLD * 100
+            }
+        ).result_rows
+        
+        if quality_issues:
+            report = "⚠️ Обнаружены проблемы с полнотой данных:\n"
+            for counter_id, date, rows, coverage in quality_issues:
+                report += f"Счетчик {counter_id}, {date}: {rows} строк, покрытие {coverage:.1f}%\n"
+            
+            etl.send_notification(report, is_error=True)
+        else:
+            logger.info("Все данные загружены с хорошим покрытием visit_id")
+            
+    except Exception as e:
+        logger.error(f"Ошибка проверки качества данных: {e}")
+
+def consolidate_results(**context) -> None:
+    """Консолидация результатов всех счетчиков"""
+    task_ids = [f"process_counter_{counter['id']}" for counter in COUNTERS]
+    
+    results = []
+    total_loaded = 0
+    successful_counters = 0
+    processing_times = []
+    
+    for task_id in task_ids:
+        try:
+            result = context['ti'].xcom_pull(task_ids=task_id)
+            if result:
+                results.append(result)
+                total_loaded += result.get('total_loaded', 0)
+                if result.get('success', False):
+                    successful_counters += 1
+                processing_times.append(result.get('processing_time', 0))
+        except Exception as e:
+            logger.warning(f"Не удалось получить результат от {task_id}: {e}")
+    
+    # Формируем итоговый отчет
+    total_counters = len(COUNTERS)
+    failed_counters = total_counters - successful_counters
+    avg_processing_time = sum(processing_times) / len(processing_times) if processing_times else 0
+    
+    summary = (f"📊 Итоговый отчет загрузки Яндекс.Метрики:\n"
+              f"Всего счетчиков: {total_counters}\n"
+              f"✅ Успешно: {successful_counters}\n"
+              f"⚠️ С ошибками: {failed_counters}\n"
+              f"📈 Загружено строк: {total_loaded:,}\n"
+              f"⏱️ Среднее время обработки: {avg_processing_time:.2f}с")
+    
+    # Детализация по каждому счетчику
+    details = "\n\nДетализация:"
+    for result in results:
+        status_emoji = "✅" if result['success'] else "⚠️"
+        details += (f"\n{status_emoji} {result['site_name']} ({result['counter_id']}): "
+                   f"{result['total_loaded']:,} строк за {result['processing_time']:.1f}с")
+        
+        if result.get('errors'):
+            details += f" - {len(result['errors'])} ошибок"
+    
+    final_message = summary + details
+    etl.send_notification(final_message, is_error=failed_counters > 0)
+    
+    # Логируем в Airflow
+    logger.info(f"Загрузка завершена. Успешно: {successful_counters}/{total_counters}, "
+               f"всего строк: {total_loaded}, среднее время: {avg_processing_time:.2f}с")
+
+def cleanup_old_data(**context) -> None:
+    """Очистка старых данных с улучшенной безопасностью"""
+    try:
+        retention_days = int(Variable.get("ym_retention_days", default_var=365))
+        
+        # Проверяем разумность периода хранения
+        if retention_days < 30:
+            logger.warning(f"Слишком короткий период хранения: {retention_days} дней. Минимум 30 дней.")
+            return
+        
+        cutoff_date = (datetime.utcnow() - timedelta(days=retention_days)).strftime("%Y-%m-%d")
+        
+        # Выполняем только если включена очистка
+        if Variable.get("ym_enable_cleanup", default_var="false").lower() == "true":
+            # Сначала проверяем количество данных для удаления
+            count_query = """
+            SELECT count() as rows_to_delete
+            FROM dev.ym_visits 
+            WHERE datetime < %(cutoff_date)s
+            """
+            
+            rows_to_delete = etl.ch_manager.client.query(
+                count_query,
+                parameters={'cutoff_date': cutoff_date}
+            ).first_row[0]
+            
+            if rows_to_delete > 0:
+                delete_query = """
+                DELETE FROM dev.ym_visits 
+                WHERE datetime < %(cutoff_date)s
+                """
+                
+                etl.ch_manager.client.command(
+                    delete_query,
+                    parameters={'cutoff_date': cutoff_date}
+                )
+                
+                logger.info(f"Удалено {rows_to_delete:,} строк старше {cutoff_date}")
+                etl.send_notification(f"🗑️ Очистка: удалено {rows_to_delete:,} строк старше {cutoff_date}")
+            else:
+                logger.info("Нет данных для удаления")
+        else:
+            logger.info("Очистка отключена в настройках")
+            
+    except Exception as e:
+        error_msg = f"Ошибка при очистке данных: {e}"
+        logger.error(error_msg)
+        etl.send_notification(error_msg, is_error=True)
+
+# Конфигурация счетчиков
+COUNTERS = [
+    {"id": "96232424", "site": "mediiia.com"}, 
+    {"id": "93017305", "site": "deziiign.com"}, 
+    {"id": "93017345", "site": "gallllery.com"}
+]
+
+# Настройки DAG
+default_args = {
+    'owner': 'data_team',
+    'depends_on_past': False,
+    'start_date': datetime(2024, 1, 1),
+    'email_on_failure': False,
+    'email_on_retry': False,
+    'retries': 2,
+    'retry_delay': timedelta(minutes=15),
+    'retry_exponential_backoff': True,
+    'max_retry_delay': timedelta(hours=1)
+}
+
+# Создание DAG
+with DAG(
+    dag_id='yandex_metrika_v2',
+    default_args=default_args,
+    description='Рефакторенная загрузка данных Яндекс.Метрики v2.0',
+    schedule_interval='0 6 * * *',
+    catchup=False,
+    max_active_runs=1,
+    tags=['etl', 'yandex_metrika', 'clickhouse', 'v2'],
+    doc_md="""
+    # Рефакторенная загрузка Яндекс.Метрики v2.0
+    
+    ## Ключевые улучшения:
+    - ✅ Исправлены SQL-инъекции (параметризованные запросы)
+    - ✅ Добавлена валидация входных данных
+    - ✅ Улучшена обработка ошибок и логирование
+    - ✅ Оптимизирована работа с памятью
+    - ✅ Добавлены типы данных и документация
+    - ✅ Разделение ответственности между классами
+    - ✅ Более безопасная очистка данных
+    - ✅ Детальная метрика производительности
+    
+    ## Настраиваемые переменные:
+    - `ym_days_back`: количество дней назад для загрузки (по умолчанию 7)
+    - `ym_retention_days`: срок хранения данных в днях (по умолчанию 365, минимум 30)
+    - `ym_enable_cleanup`: включить автоочистку старых данных (по умолчанию false)
+    
+    ## Переменные окружения:
+    - `YM_TOKEN`: токен доступа к API Яндекс.Метрики
+    - `CLICKHOUSE_HOST`, `CLICKHOUSE_PORT`, `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD`, `CLICKHOUSE_DB`
+    """
+) as dag:
+
+    # Создание задач для каждого счетчика
+    counter_tasks = []
+    
+    for counter in COUNTERS:
+        task = PythonOperator(
+            task_id=f"process_counter_{counter['id']}",
+            python_callable=process_single_counter,
+            op_kwargs={
+                "counter_id": counter["id"],
+                "site_name": counter["site"]
+            },
+            execution_timeout=timedelta(hours=3),
+            pool='yandex_metrika_pool',
+            doc_md=f"Загрузка данных для счетчика {counter['id']} ({counter['site']})"
+        )
+        counter_tasks.append(task)
+
+    # Консолидация результатов
+    consolidate_task = PythonOperator(
+        task_id='consolidate_results',
+        python_callable=consolidate_results,
+        trigger_rule=TriggerRule.ALL_DONE,
+        doc_md="Консолидация результатов загрузки всех счетчиков"
+    )
+
+    # Проверка качества данных
+    quality_check_task = PythonOperator(
+        task_id='data_quality_check',
+        python_callable=get_data_quality_report,
+        trigger_rule=TriggerRule.ALL_DONE,
+        doc_md="Проверка полноты загрузки по покрытию visit_id"
+    )
+
+    # Опциональная очистка старых данных
+    cleanup_task = PythonOperator(
+        task_id='cleanup_old_data',
+        python_callable=cleanup_old_data,
+        trigger_rule=TriggerRule.ALL_DONE,
+        doc_md="Безопасная очистка старых данных (если включена в настройках)"
+    )
+
+    # Определение зависимостей
+    counter_tasks >> consolidate_task >> quality_check_task >> cleanup_task 
